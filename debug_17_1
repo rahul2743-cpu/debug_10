@@ -1,0 +1,43 @@
+def debug_subgraph(question):
+    print("QUESTION:", question)
+
+    phrases = extract_query_entities(question)
+    print("\n[1] phrases:", phrases, "| type:", type(phrases))
+
+    linked_seeds = link_entities(phrases) if phrases else []
+    print("\n[2] link_entities ->", len(linked_seeds), "seeds")
+    for s in linked_seeds[:10]:
+        print("   ", s)
+
+    linked = {s[3] for s in linked_seeds}
+    print("\n[3] linked set:", linked)
+    for phrase, _cls in (phrases or []):
+        print(f"    {phrase!r}: {'LINKED' if phrase in linked else 'NOT linked -> content_search'}")
+
+    extra = []
+    for phrase, _cls in (phrases or []):
+        if phrase not in linked:
+            r = content_search(phrase)
+            print(f"\n[4] content_search({phrase!r}) -> {len(r)} seeds")
+            for s in r[:5]:
+                print("   ", s)
+            extra += r
+
+    all_seeds = list(linked_seeds) + extra
+    print("\n[5] score ranges:")
+    for name, lst in [("link", linked_seeds), ("content", extra)]:
+        if lst:
+            sc = [s[2] for s in lst]
+            print(f"    {name}: min={min(sc)} max={max(sc)}")
+
+    # dedup check
+    from collections import Counter
+    dup = [n for n, c in Counter(s[0] for s in all_seeds).items() if c > 1]
+    print("\n[6] nodes seeded more than once:", dup)
+
+    ph, seeds, edges, visited = get_subgraph(question)
+    print("\n[7] final seeds:", len(seeds), "| edges:", len(edges), "| visited:", len(visited))
+    print("    edge sample:", edges[:2])
+    print("    seed node types:", Counter(G.nodes[s[0]].get("node_type") for s in seeds))
+
+debug_subgraph("YOUR QUESTION HERE")
