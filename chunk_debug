@@ -1,0 +1,99 @@
+from collections import Counter
+import statistics as st
+
+
+def debug_chunking(sample_doc=None, question="How do I open the OpenTCCM model using MTCCM?"):
+    print("=" * 70)
+    print("CHUNKING DEBUG")
+    print("=" * 70)
+
+    # ---------- [1] coverage: which documents got chunks ----------
+    doc_nodes = [(n, d) for n, d in G.nodes(data=True) if d.get("node_type") == "document"]
+    no_content = [n for n, d in doc_nodes if not (d.get("content") or "").strip()]
+    no_chunks = [n for n, _ in doc_nodes if n not in CHUNKS_BY_DOC]
+    print(f"\n[1] document nodes={len(doc_nodes)}  with chunks={len(CHUNKS_BY_DOC)}  "
+          f"total chunks={len(CHUNKS)}")
+    print(f"    empty/missing content: {len(no_content)}   docs with 0 chunks: {len(no_chunks)}")
+    for n in no_chunks[:5]:
+        print("     ", n, "|", G.nodes[n].get("label"))
+
+    # ---------- [2] chunk size statistics ----------
+    lens = [len(c["text"]) for c in CHUNKS]
+    if lens:
+        print(f"\n[2] chunk chars: min={min(lens)} median={int(st.median(lens))} "
+              f"mean={int(st.mean(lens))} max={max(lens)}")
+        over = [c for c in CHUNKS if len(c["text"]) > CHUNK_SIZE]
+        short = [c for c in CHUNKS if len(c["text"]) < MIN_CHUNK_SIZE]
+        print(f"    > CHUNK_SIZE ({CHUNK_SIZE}): {len(over)}   "
+              f"< MIN_CHUNK_SIZE ({MIN_CHUNK_SIZE}): {len(short)}")
+        worst = sorted(over, key=lambda c: -len(c["text"]))[:3]
+        for c in worst:
+            print(f"      biggest: {c['chunk_id']} {len(c['text'])} chars")
+        per_doc = Counter(len(v) for v in CHUNKS_BY_DOC.values())
+        print("    chunks-per-doc histogram:", dict(sorted(per_doc.items())[:10]))
+        zero_terms = [c for c in CHUNKS if c["len"] == 0]
+        print(f"    chunks with 0 usable terms: {len(zero_terms)}")
+
+    # ---------- [3] regex check: did sentence splitting work? ----------
+    long_docs = [(n, d) for n, d in doc_nodes
+                 if len(re.sub(r"\s+", " ", d.get("content") or "").strip()) > CHUNK_SIZE]
+    unsplit = []
+    for n, d in long_docs:
+        t = re.sub(r"\s+", " ", d.get("content") or "").strip()
+        if len(_SENT_SPLIT.split(t)) == 1:
+            unsplit.append(n)
+    print(f"\n[3] docs longer than CHUNK_SIZE: {len(long_docs)}   "
+          f"regex produced NO split: {len(unsplit)}")
+    for n in unsplit[:5]:
+        t = G.nodes[n].get("content") or ""
+        print(f"      {G.nodes[n].get('label')}  (has '>' count={t.count('>')}, '<' count={t.count('<')})")
+
+    # ---------- [4] marker integrity ----------
+    broken = [c for c in CHUNKS if c["text"].count("<") != c["text"].count(">")]
+    print(f"\n[4] chunks with unbalanced < > (possible split marker): {len(broken)}")
+    for c in broken[:3]:
+        print("      ", c["chunk_id"], "|", c["text"][:80].replace("\n", " "), "...",
+              c["text"][-60:])
+
+    # ---------- [5] text loss / duplication ----------
+    lossy = []
+    for n, d in doc_nodes:
+        if n not in CHUNKS_BY_DOC:
+            continue
+        orig = re.sub(r"\s+", " ", d.get("content") or "").strip()
+        rebuilt = " ".join(c["text"] for c in sorted(CHUNKS_BY_DOC[n], key=lambda c: c["chunk_index"]))
+        if re.sub(r"\s+", "", orig) != re.sub(r"\s+", "", rebuilt):
+            lossy.append((n, len(orig), len(rebuilt)))
+    print(f"\n[5] docs where chunks do not rebuild the original text: {len(lossy)}")
+    for n, a, b in lossy[:5]:
+        print(f"      {G.nodes[n].get('label')}: original={a} rebuilt={b}")
+
+    # ---------- [6] term statistics ----------
+    print(f"\n[6] top 15 terms by document frequency (check for marker words):")
+    df = Counter(t for c in CHUNKS for t in c["tf"])
+    for t, c in df.most_common(15):
+        print(f"      {t:15s} in {c} chunks ({100*c/max(len(CHUNKS),1):.0f}%)")
+
+    print(f"\n    _terms(question) = {_terms(question)}")
+    raw = re.findall(r"[a-z0-9]+", question.lower())
+    dropped = [w for w in raw if w not in set(_terms(question)) and w not in
+               {t[:-1] for t in _terms(question)}]
+    print(f"    raw words dropped by stop list/length: {dropped}")
+
+    # ---------- [7] look at one document ----------
+    target = None
+    if sample_doc:
+        target = sample_doc if sample_doc in CHUNKS_BY_DOC else next(
+            (n for n in CHUNKS_BY_DOC
+             if sample_doc.lower() in str(G.nodes[n].get("label", "")).lower()), None)
+    if target is None and CHUNKS_BY_DOC:
+        target = max(CHUNKS_BY_DOC, key=lambda n: len(CHUNKS_BY_DOC[n]))
+    if target:
+        print(f"\n[7] sample document: {G.nodes[target].get('label', target)}")
+        for c in CHUNKS_BY_DOC[target][:4]:
+            print(f"    --- {c['chunk_id']}  chars={len(c['text'])}  terms={c['len']}")
+            print("    START:", c["text"][:120])
+            print("    END  :", c["text"][-120:])
+
+
+debug_chunking(sample_doc="MTCCM.Run OpenTCCM")
