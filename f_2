@@ -1,0 +1,65 @@
+from collections import Counter
+
+def debug_ppr(question):
+    print("QUESTION:", question)
+    phrases, seeds, edges, visited = get_subgraph(question)
+
+    # [1] input sanity
+    print(f"\n[1] seeds={len(seeds)} edges={len(edges)}")
+    print("    seed scores:", [(s[0], s[2]) for s in seeds[:8]])
+    print("    score types:", Counter(type(s[2]).__name__ for s in seeds))
+
+    bad = []
+    for e in edges:
+        try:
+            w = float(e["strength"])
+            if w <= 0:
+                bad.append(("non-positive", e))
+            if e["source"] not in G or e["target"] not in G:
+                bad.append(("node not in G", e))
+        except Exception as ex:
+            bad.append((repr(ex), e))
+    print(f"    bad edges: {len(bad)}")
+    for b in bad[:5]:
+        print("     ", b)
+
+    ws = [float(e["strength"]) for e in edges if e.get("strength") is not None]
+    if ws:
+        print(f"    strength min={min(ws)} max={max(ws)} mean={sum(ws)/len(ws):.3f}")
+
+    # [2] build graph + run PPR
+    sub, ppr = personalized_pagerank(seeds, edges)
+    print(f"\n[2] sub nodes={sub.number_of_nodes()} edges={sub.number_of_edges()}")
+    print("    sum of PPR (expect ~1.0):", round(sum(ppr.values()), 6))
+
+    seed_ids = {s[0] for s in seeds}
+    isolated = [n for n in seed_ids if sub.degree(n) == 0]
+    print("    isolated seeds:", isolated)
+    print("    components:", nx.number_connected_components(sub))
+
+    # [3] top nodes
+    print("\n[3] top 10 nodes by PPR")
+    for n, v in sorted(ppr.items(), key=lambda x: -x[1])[:10]:
+        print(f"    {v:.4f}  {G.nodes[n].get('node_type'):10s}  "
+              f"{'SEED' if n in seed_ids else '    '}  {G.nodes[n].get('label', n)}")
+
+    # [4] mass on seeds vs non-seeds, by node type
+    seed_mass = sum(v for n, v in ppr.items() if n in seed_ids)
+    print(f"\n[4] mass on seeds={seed_mass:.3f}, on others={1-seed_mass:.3f}")
+    by_type = Counter()
+    for n, v in ppr.items():
+        by_type[G.nodes[n].get("node_type")] += v
+    print("    mass by node type:", {k: round(v, 3) for k, v in by_type.items()})
+
+    # [5] ties among documents
+    docs = [(n, round(v, 6)) for n, v in ppr.items() if G.nodes[n].get("node_type") == "document"]
+    ties = [s for s, c in Counter(s for _, s in docs).items() if c > 1]
+    print(f"\n[5] documents in subgraph={len(docs)}, tied PPR values={len(ties)}")
+
+    # [6] does personalization matter? compare against plain PageRank
+    plain = nx.pagerank(sub, alpha=PPR_DAMPING, weight="weight")
+    top_p = [n for n, _ in sorted(ppr.items(), key=lambda x: -x[1])[:6]]
+    top_u = [n for n, _ in sorted(plain.items(), key=lambda x: -x[1])[:6]]
+    print(f"\n[6] top-6 overlap personalized vs plain: {len(set(top_p) & set(top_u))}/6")
+
+debug_ppr("YOUR QUESTION HERE")
