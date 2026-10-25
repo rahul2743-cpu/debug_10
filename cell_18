@@ -1,0 +1,123 @@
+# ==========================================================
+# CELL 18C - DEBUG: see what every step of Cell 18 is doing
+# Run AFTER Cell 18. Change QUESTION and run again.
+# ==========================================================
+import json
+
+QUESTION      = "your question here"
+SHOW_FULL_CTX = False     # True = print the whole context sent to the LLM
+PREVIEW_CHARS = 300       # how much of each chunk to preview
+
+def line(title):
+    print("\n" + "=" * 80)
+    print(title)
+    print("=" * 80)
+
+# ----------------------------------------------------------
+# STAGE 1 : get_subgraph  (Cell 15 + 16)
+# ----------------------------------------------------------
+line("STAGE 1 - get_subgraph()")
+phrases, seeds, edges, visited = get_subgraph(QUESTION)
+print(f"phrases extracted : {len(phrases)}")
+print(f"  {phrases}")
+print(f"seed nodes        : {len(seeds)}")
+print(f"  {seeds}")
+print(f"edges found       : {len(edges)}")
+print(f"visited nodes     : {len(visited)}")
+
+if edges:
+    print("\nFirst 5 edges (raw):")
+    for e in edges[:5]:
+        print("  ", {k: (str(v)[:60]) for k, v in e.items()})
+else:
+    print("\n  !! NO EDGES -> relationships will be empty. Check seeds/phrases.")
+
+# ----------------------------------------------------------
+# STAGE 2 : rank_chunks  (Cell 17)
+# ----------------------------------------------------------
+line("STAGE 2 - rank_chunks()")
+top_chunks, doc_ranking = rank_chunks(QUESTION, phrases, seeds, edges)
+print(f"top_chunks returned : {len(top_chunks)}")
+print(f"doc_ranking         : {doc_ranking}")
+
+if not top_chunks:
+    print("\n  !! NO CHUNKS -> answer_question() will return NO_ANSWER immediately.")
+else:
+    print("\nChunks (in order sent to context):")
+    for i, c in enumerate(top_chunks, 1):
+        print(f"\n  #{i}  title={c['title']}  chunk_id={c['chunk_id']}  "
+              f"bm25={c['bm25']:.4f}  len={len(c['text'])}")
+        print(f"      doc={c['doc']}")
+        print(f"      text: {c['text'][:PREVIEW_CHARS].replace(chr(10), ' ')}...")
+
+# ----------------------------------------------------------
+# STAGE 3 : build_context  (Cell 18, Step 1)
+# ----------------------------------------------------------
+line("STAGE 3 - build_context()")
+if top_chunks:
+    context, sources = build_context(top_chunks, edges)
+
+    print(f"Context size       : {len(context)} chars  (limit {MAX_CONTEXT_CHARS})")
+    print(f"Chunks available   : {len(top_chunks)}")
+    print(f"Chunks that FIT    : {len(sources)}")
+    if len(sources) < len(top_chunks):
+        print(f"  !! {len(top_chunks) - len(sources)} chunk(s) DROPPED (budget full)")
+
+    has_rel = context.startswith("RELATIONSHIPS:")
+    print(f"Relationships in ctx: {has_rel}")
+    if has_rel:
+        rel_part = context.split("DOCUMENT EXCERPTS:")[0]
+        print(f"  relationship lines: {rel_part.count(chr(10)) - 1}")
+        print(f"  relationship chars: {len(rel_part)}  (limit {MAX_REL_CHARS})")
+
+    print("\nSources placed in context:")
+    for s in sources:
+        print("  ", s)
+
+    if SHOW_FULL_CTX:
+        print("\n--- FULL CONTEXT SENT TO LLM ---")
+        print(context)
+
+    # ------------------------------------------------------
+    # STAGE 4 : LLM call
+    # ------------------------------------------------------
+    line("STAGE 4 - LLM call")
+    messages = [
+        {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
+        {"role": "user", "content": f"CONTEXT:\n{context}\n\nQUESTION: {QUESTION}"},
+    ]
+    total_prompt_chars = sum(len(m["content"]) for m in messages)
+    print(f"Prompt size: {total_prompt_chars} chars (~{total_prompt_chars // 4} tokens)")
+
+    resp = llm.invoke(messages)
+    print(f"Response type: {type(resp.content).__name__}")
+
+    # token usage, if the LLM reports it
+    usage = getattr(resp, "usage_metadata", None) or getattr(resp, "response_metadata", {})
+    print(f"Usage info   : {usage}")
+
+    answer = resp.content if isinstance(resp.content, str) else str(resp.content)
+
+    line("RAW LLM ANSWER")
+    print(answer)
+
+    # ------------------------------------------------------
+    # STAGE 5 : citation check
+    # ------------------------------------------------------
+    line("STAGE 5 - check_citations()")
+    cit = check_citations(answer, sources)
+    print(f"Cited refs      : {cit['cited']}")
+    print(f"Invalid refs    : {cit['invalid']}")
+    print(f"Uncited answer  : {cit['uncited_answer']}")
+
+    if cit["invalid"]:
+        print("  !! LLM cited numbers that don't exist in the context (hallucinated citations)")
+    if cit["uncited_answer"]:
+        print("  !! LLM gave an answer without any [n] citation")
+    if answer.strip() == NO_ANSWER:
+        print("  !! LLM said 'not enough information' - check Stage 2/3: were the right chunks retrieved?")
+
+    unused = [s["ref"] for s in sources if s["ref"] not in cit["cited"]]
+    print(f"Excerpts given but never cited: {unused}")
+
+line("DEBUG DONE")
