@@ -1,0 +1,390 @@
+# ==========================================================
+# Cell 17 : SUBGRAPH-FILTERED HYBRID RETRIEVAL + DATABRICKS RERANKER
+#
+#   Cell 16 subgraph
+#     -> document nodes only (entity-only nodes excluded)
+#     -> document node -> ex:sourceReference -> source (via knowledge_nodes)
+#     -> eligible source list (dynamic, from this query only)
+#     -> metadata filter on the existing index (no post-filtering)
+#     -> hybrid search + DatabricksReranker (one API request)
+#     -> TOP_K -> retrieved_context (structured) + llm_context (string)
+#
+#   Needs from earlier cells:
+#     QUERY, edges, visited   (Cell 16 traversal output)
+#     g                       (RDF graph, Cell 11)
+#     knowledge_nodes         (node_id, source; Cell 6)
+#   Does NOT call the LLM, re-chunk, re-embed, or rebuild the index.
+# ==========================================================
+from rdflib import URIRef, RDFS
+from databricks.vector_search.client import VectorSearchClient
+from databricks.vector_search.reranker import DatabricksReranker
+
+print("=" * 80)
+print("CELL 17 - SUBGRAPH-FILTERED HYBRID RETRIEVAL")
+print("=" * 80)
+
+for _name in ("QUERY", "edges", "visited", "g", "knowledge_nodes"):
+    if _name not in globals():
+        raise RuntimeError(f"'{_name}' is not defined - run Cells 1-16 first (or fix the name).")
+
+# ----------------------------------------------------------
+# 0. CONFIGURATION (explicit choices, not derived from examples)
+# ----------------------------------------------------------
+VS_ENDPOINT_NAME  = "knowbot_vector_search"
+VS_INDEX_NAME     = "knwbt_airr_foundry_dev_catalog.secured.200_xml_data"
+VS_ENDPOINT_TYPE  = "standard"       # "standard" -> dict filters; "storage_optimized" -> SQL string
+VS_TEXT_COLUMN    = "content"        # chunk text (embedded and reranked)
+VS_ID_COLUMN      = "id"             # chunk identifier (CHECK: chunk id or doc id)
+VS_DOC_KEY_COLUMN = "source"         # metadata column naming the source XML article (CHECK)
+VS_QUERY_TYPE     = "hybrid"
+
+VS_CANDIDATE_K    = 50               # hybrid candidates requested per query (config choice)
+TOP_K             = 10               # final chunks for the LLM (K=10 in the eval notebook)
+DEBUG_PRE_RERANK  = False            # True = extra call without reranker, to inspect its effect
+
+# Finds every RDF document node and its reference (written by Cell 11 as ex:sourceReference)
+DOC_REF_QUERY = """
+PREFIX ex: <http://knwbt.local/kg/schema/>
+SELECT ?doc ?ref
+WHERE {
+    ?doc a ex:Document ;
+         ex:sourceReference ?ref .
+}
+"""
+
+
+def _fail(status, message, **extra):
+    out = {
+        "status": status,
+        "message": message,
+        "eligible_document_ids": [],
+        "retrieved_context": [],
+        "llm_context": "",
+    }
+    out.update(extra)
+    return out
+
+
+def build_metadata_filter(sources):
+    """Admit only chunks whose source metadata is in `sources`."""
+    if VS_ENDPOINT_TYPE == "standard":
+        # Standard endpoints: dict key with a list value = IN
+        return {VS_DOC_KEY_COLUMN: sources}
+    # Storage-optimized endpoints: SQL-like string, single quotes escaped
+    quoted = ", ".join("'" + s.replace("'", "''") + "'" for s in sources)
+    return f"{VS_DOC_KEY_COLUMN} IN ({quoted})"
+
+
+def run_subgraph_filtered_retrieval(query, edges, visited):
+
+    # ---- Step 1: nodes of the Cell 16 subgraph ----------------
+    subgraph_nodes = set(visited.keys())
+    for e in edges:
+        subgraph_nodes.add(e["source"])
+        subgraph_nodes.add(e["target"])
+
+    print(f"Subgraph nodes (Cell 16)   : {len(subgraph_nodes)}")
+    print(f"Subgraph edges (Cell 16)   : {len(edges)}")
+
+    if not subgraph_nodes:
+        return _fail("empty_subgraph", "Cell 16 produced an empty subgraph; no retrieval run.")
+
+    # ---- Step 2: document nodes vs entity-only nodes ----------
+    doc_uri_to_ref = {str(r.doc): str(r.ref).strip() for r in g.query(DOC_REF_QUERY)}
+    doc_nodes = [n for n in subgraph_nodes if n in doc_uri_to_ref]
+    entity_only = len(subgraph_nodes) - len(doc_nodes)
+
+    print(f"Document nodes in subgraph : {len(doc_nodes)}")
+    print(f"Entity-only nodes excluded : {entity_only}")
+
+    if not doc_nodes:
+        return _fail("no_document_nodes", "The subgraph contains no document nodes.")
+
+    # node_id (reference) -> source value stored in the index
+    ref_to_source = {}
+    for r in knowledge_nodes.select("node_id", "source").distinct().collect():
+        if r["node_id"] and r["source"]:
+            ref_to_source[str(r["node_id"]).strip()] = str(r["source"]).strip()
+
+    doc_records, unmapped = [], []
+    for uri in doc_nodes:
+        ref = doc_uri_to_ref[uri]
+        src = ref_to_source.get(ref)
+        if src is None:
+            unmapped.append((uri, ref))
+            continue
+        label = g.value(URIRef(uri), RDFS.label)
+        hop = visited.get(uri, (None, None))[0]
+        doc_records.append({
+            "doc_uri": uri,
+            "doc_reference": ref,
+            "doc_source": src,
+            "doc_title": str(label) if label else ref,
+            "hop": hop,
+        })
+
+    if unmapped:
+        print(f"WARNING: {len(unmapped)} document node(s) have no source mapping and are excluded:")
+        for _, ref in unmapped[:10]:
+            print(f"   - {ref}")
+
+    eligible_sources = sorted({d["doc_source"] for d in doc_records})
+    unmapped_refs = [ref for _, ref in unmapped]
+
+    if not eligible_sources:
+        return _fail("no_eligible_documents",
+                     "No subgraph document maps to an index source.",
+                     unmapped_refs=unmapped_refs)
+
+    print(f"Eligible documents for this query : {len(eligible_sources)}")
+
+    # ---- Steps 3-5: filtered hybrid search + reranker ---------
+    search_kwargs = dict(
+        query_text=query,
+        columns=[VS_ID_COLUMN, VS_TEXT_COLUMN, VS_DOC_KEY_COLUMN],
+        filters=build_metadata_filter(eligible_sources),
+        num_results=VS_CANDIDATE_K,
+        query_type=VS_QUERY_TYPE,
+        reranker=DatabricksReranker(columns_to_rerank=[VS_TEXT_COLUMN]),
+    )
+
+    try:
+        index = VectorSearchClient().get_index(
+            endpoint_name=VS_ENDPOINT_NAME,
+            index_name=VS_INDEX_NAME,
+        )
+        res = index.similarity_search(**search_kwargs)
+    except Exception as e:
+        return _fail("api_error",
+                     f"Vector Search call failed: {e}",
+                     eligible_document_ids=eligible_sources,
+                     unmapped_refs=unmapped_refs)
+
+    # ---- Parse the response by column name, not by position ---
+    manifest_cols = [c.get("name") for c in (res.get("manifest") or {}).get("columns", [])]
+    rows = (res.get("result") or {}).get("data_array") or []
+
+    if manifest_cols:
+        def col(name):
+            if name not in manifest_cols:
+                raise RuntimeError(f"Column '{name}' missing from response manifest: {manifest_cols}")
+            return manifest_cols.index(name)
+
+        i_id, i_txt, i_doc = col(VS_ID_COLUMN), col(VS_TEXT_COLUMN), col(VS_DOC_KEY_COLUMN)
+        i_score = next((i for i, n in enumerate(manifest_cols) if "score" in str(n).lower()), None)
+    else:
+        # No manifest: fall back to the requested column order
+        i_id, i_txt, i_doc = 0, 1, 2
+        i_score = 3 if rows and len(rows[0]) > 3 else None
+
+    eligible_set = set(eligible_sources)
+    candidates, out_of_scope = [], 0
+
+    for pos, row in enumerate(rows):          # server order = reranker order
+        doc_key = None if row[i_doc] is None else str(row[i_doc])
+        if doc_key not in eligible_set:
+            out_of_scope += 1                 # should be 0 - the filter already excludes these
+            continue
+        score = row[i_score] if i_score is not None else None
+        candidates.append({
+            "rerank_position": pos,
+            "chunk_id": row[i_id],
+            "content": row[i_txt] or "",
+            "doc_source": doc_key,
+            "score": None if score is None else float(score),
+        })
+
+    if out_of_scope:
+        print(f"WARNING: {out_of_scope} returned chunk(s) were outside the eligible set; dropped.")
+
+    print(f"Hybrid + reranker results returned   : {len(rows)}")
+    print(f"Candidates inside eligible documents : {len(candidates)}")
+
+    scores = [c["score"] for c in candidates if c["score"] is not None]
+    if len(scores) > 1 and not all(a >= b for a, b in zip(scores, scores[1:])):
+        print("NOTE: scores are not descending; keeping the server (reranker) order.")
+
+    if DEBUG_PRE_RERANK:
+        kw = {k: v for k, v in search_kwargs.items() if k != "reranker"}
+        pre_rows = (index.similarity_search(**kw).get("result") or {}).get("data_array") or []
+        pre_ids = [r[i_id] for r in pre_rows]
+        post_ids = [c["chunk_id"] for c in candidates]
+        print("Pre-rerank ids  (first 10):", pre_ids[:10])
+        print("Post-rerank ids (first 10):", post_ids[:10])
+        print("Same candidate set:", set(pre_ids) == set(post_ids))
+
+    # ---- Step 6: configurable Top-K ---------------------------
+    if not candidates:
+        return _fail("no_matching_chunks",
+                     "Filtered search returned no chunks from the eligible documents.",
+                     eligible_document_ids=eligible_sources,
+                     unmapped_refs=unmapped_refs)
+
+    selected = candidates[:TOP_K]
+    if len(selected) < TOP_K:
+        print(f"Only {len(selected)} chunk(s) available (TOP_K={TOP_K}); returning those.")
+
+    # ---- Step 7: structured context and LLM string ------------
+    docs_by_source = {}
+    for d in doc_records:
+        docs_by_source.setdefault(d["doc_source"], []).append(d)
+
+    retrieved_context = []
+    for rank, c in enumerate(selected, start=1):
+        d = docs_by_source[c["doc_source"]][0]   # first subgraph node with this source
+        retrieved_context.append({
+            "rank": rank,
+            "chunk_id": c["chunk_id"],
+            "content": c["content"],
+            "doc_source": c["doc_source"],
+            "doc_reference": d["doc_reference"],
+            "doc_uri": d["doc_uri"],
+            "doc_title": d["doc_title"],
+            "doc_hop": d["hop"],
+            "score": c["score"],
+            "rerank_position": c["rerank_position"],
+        })
+
+    blocks = []
+    for item in retrieved_context:
+        score_txt = "" if item["score"] is None else f" | score: {item['score']:.4f}"
+        blocks.append(
+            f"[{item['rank']}] Source article: {item['doc_title']} "
+            f"| doc: {item['doc_source']}{score_txt}\n{item['content']}"
+        )
+    llm_context = "\n\n".join(blocks)
+
+    return {
+        "status": "ok",
+        "message": f"Retrieved {len(retrieved_context)} chunk(s) from {len(eligible_sources)} eligible document(s).",
+        "eligible_document_ids": eligible_sources,
+        "retrieved_context": retrieved_context,
+        "llm_context": llm_context,
+        "unmapped_refs": unmapped_refs,
+    }
+
+
+# ----------------------------------------------------------
+# RUN
+# ----------------------------------------------------------
+result = run_subgraph_filtered_retrieval(QUERY, edges, visited)
+
+retrieval_status        = result["status"]
+eligible_document_ids   = result["eligible_document_ids"]
+retrieved_context       = result["retrieved_context"]
+llm_context             = result["llm_context"]
+
+print()
+print(f"STATUS                : {retrieval_status}")
+print(result["message"])
+print(f"Eligible document IDs : {len(eligible_document_ids)}")
+print(eligible_document_ids)
+print()
+for item in retrieved_context:
+    print(f"#{item['rank']:<3} score={item['score']}  doc={item['doc_source']}  hop={item['doc_hop']}")
+
+
+
+
+    ======================================
+DEBUG
+==========
+import pandas as pd
+
+# 1. The exact text that will go to the LLM
+print(llm_context)
+print(f"\nContext length: {len(llm_context)} characters")
+
+# 2. The structured version as a table (content shortened for viewing)
+if retrieved_context:
+    view_df = pd.DataFrame(retrieved_context)
+    view_df["content"] = view_df["content"].str.slice(0, 200) + "..."
+    display(view_df[["rank", "score", "doc_title", "doc_source", "doc_hop", "chunk_id", "content"]])
+else:
+    print("No chunks retrieved - status:", retrieval_status)
+
+======
+
+# ==========================================================
+# Cell 17-DEBUG : inspect each stage of Cell 17
+# Run AFTER Cell 17. Changes nothing; only prints.
+# ==========================================================
+import json
+
+print("=" * 80)
+print("CELL 17 DEBUG")
+print("=" * 80)
+
+# ---- Stage 1: subgraph nodes, documents vs entities ----
+sub_nodes = set(visited) | {e["source"] for e in edges} | {e["target"] for e in edges}
+doc_map = {str(r.doc): str(r.ref).strip() for r in g.query(DOC_REF_QUERY)}
+
+print("\n[1] Subgraph node classification (first 15):")
+for n in list(sub_nodes)[:15]:
+    kind = "DOCUMENT" if n in doc_map else "entity"
+    hop = visited.get(n, (None, None))[0]
+    label = g.value(URIRef(n), RDFS.label)
+    print(f"  {kind:8} hop={hop}  {label}")
+
+# ---- Stage 2: reference -> source mapping ----
+ref_src = {str(r["node_id"]).strip(): str(r["source"]).strip()
+           for r in knowledge_nodes.select("node_id", "source").distinct().collect()
+           if r["node_id"] and r["source"]}
+
+print("\n[2] Document reference -> index source:")
+for n in sub_nodes:
+    if n in doc_map:
+        ref = doc_map[n]
+        print(f"  {ref}  ->  {ref_src.get(ref, 'NOT MAPPED')}")
+
+# ---- Stage 3: the exact filter sent to Vector Search ----
+print("\n[3] Metadata filter sent to the index:")
+if eligible_document_ids:
+    print(json.dumps(build_metadata_filter(eligible_document_ids), indent=2, default=str)[:3000])
+else:
+    print("  (none - status was", retrieval_status, ")")
+
+# ---- Stage 4: raw response structure (one small probe call) ----
+print("\n[4] Raw response structure:")
+if eligible_document_ids:
+    try:
+        idx = VectorSearchClient().get_index(endpoint_name=VS_ENDPOINT_NAME,
+                                             index_name=VS_INDEX_NAME)
+        probe = idx.similarity_search(
+            query_text=QUERY,
+            columns=[VS_ID_COLUMN, VS_TEXT_COLUMN, VS_DOC_KEY_COLUMN],
+            filters=build_metadata_filter(eligible_document_ids),
+            num_results=3,
+            query_type=VS_QUERY_TYPE,
+            reranker=DatabricksReranker(columns_to_rerank=[VS_TEXT_COLUMN]),
+        )
+        cols = [c.get("name") for c in (probe.get("manifest") or {}).get("columns", [])]
+        print("  Manifest columns:", cols)
+        for row in (probe.get("result") or {}).get("data_array") or []:
+            print("  Row:", [str(v)[:80] for v in row])
+    except Exception as e:
+        print("  Probe failed:", e)
+
+# ---- Stage 5: do the eligible sources exist in the index? ----
+print("\n[5] Index match check (first 5 eligible sources, filter-only query):")
+for src in eligible_document_ids[:5]:
+    try:
+        r = idx.similarity_search(columns=[VS_ID_COLUMN, VS_DOC_KEY_COLUMN],
+                                  filters={VS_DOC_KEY_COLUMN: src} if VS_ENDPOINT_TYPE == "standard"
+                                          else f"{VS_DOC_KEY_COLUMN} = '{src}'",
+                                  num_results=1)
+        found = bool((r.get("result") or {}).get("data_array"))
+        print(f"  {'FOUND  ' if found else 'MISSING'}  {src}")
+    except Exception as e:
+        print(f"  ERROR    {src}: {e}")
+
+# ---- Stage 6: final context checks ----
+print("\n[6] Final context:")
+print(f"  Chunks in retrieved_context : {len(retrieved_context)}")
+print(f"  llm_context length (chars)  : {len(llm_context)}")
+bad = [c for c in retrieved_context if c["doc_source"] not in set(eligible_document_ids)]
+print(f"  Chunks outside eligible docs: {len(bad)}  (must be 0)")
+
+
+============================>
+
