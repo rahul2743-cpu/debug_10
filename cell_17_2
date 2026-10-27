@@ -1,0 +1,557 @@
+
+# ==========================================================
+# CELL 17: SUBGRAPH-FILTERED HYBRID RETRIEVAL + RERANKER
+#
+# Cell 16 subgraph
+#   -> identify document nodes
+#   -> map graph references to source metadata
+#   -> filter existing Vector Search index
+#   -> hybrid retrieval + Databricks reranker
+#   -> Top-K chunks
+#   -> retrieved_context + llm_context
+#
+# No rechunking, re-embedding, index rebuilding, or LLM call.
+# ==========================================================
+
+from rdflib import URIRef, RDFS
+from pyspark.sql import functions as F
+from databricks.vector_search.client import VectorSearchClient
+from databricks.vector_search.reranker import DatabricksReranker
+
+
+# ----------------------------------------------------------
+# 1. CONFIGURATION
+# ----------------------------------------------------------
+
+VS_ENDPOINT_NAME = "knowbot_vector_search"
+VS_INDEX_NAME = (
+    "knwbt_airr_foundry_dev_catalog.secured.200_xml_data"
+)
+
+VS_ENDPOINT_TYPE = "standard"
+# Use "storage_optimized" if that is your actual endpoint type.
+
+VS_ID_COLUMN = "id"
+VS_TEXT_COLUMN = "content"
+VS_DOC_KEY_COLUMN = "source"
+
+TOP_K = 10
+QUERY_TYPE = "hybrid"
+
+# Set True only when you want diagnostic output.
+DEBUG = False
+
+
+# ----------------------------------------------------------
+# 2. VALIDATE EXISTING NOTEBOOK DEPENDENCIES
+# ----------------------------------------------------------
+
+_required = (
+    "QUERY", "edges", "visited", "g", "knowledge_nodes"
+)
+
+_missing = [
+    name for name in _required
+    if name not in globals()
+]
+
+if _missing:
+    raise RuntimeError(
+        f"Run the prerequisite notebook cells first. "
+        f"Missing variables: {_missing}"
+    )
+
+if not isinstance(QUERY, str) or not QUERY.strip():
+    raise ValueError("QUERY must be a non-empty string.")
+
+if TOP_K < 1:
+    raise ValueError("TOP_K must be at least 1.")
+
+_required_columns = {"node_id", "source"}
+_missing_columns = (
+    _required_columns - set(knowledge_nodes.columns)
+)
+
+if _missing_columns:
+    raise RuntimeError(
+        "knowledge_nodes is missing columns: "
+        f"{sorted(_missing_columns)}"
+    )
+
+
+# ----------------------------------------------------------
+# 3. HELPER FUNCTIONS
+# ----------------------------------------------------------
+
+def _clean(value):
+    """Normalize a scalar identifier to a trimmed string."""
+    if value is None:
+        return None
+
+    value = str(value).strip()
+    return value or None
+
+
+def _build_filter(source_values):
+    """Build the appropriate filter for the endpoint type."""
+    source_values = sorted({
+        value for value in map(_clean, source_values)
+        if value is not None
+    })
+
+    if not source_values:
+        raise ValueError(
+            "Cannot create a metadata filter with no sources."
+        )
+
+    if VS_ENDPOINT_TYPE == "standard":
+        # A list means match ANY of these source values.
+        return {VS_DOC_KEY_COLUMN: source_values}
+
+    if VS_ENDPOINT_TYPE == "storage_optimized":
+        # Escape SQL string literals safely.
+        quoted = ", ".join(
+            "'" + value.replace("'", "''") + "'"
+            for value in source_values
+        )
+        return f"{VS_DOC_KEY_COLUMN} IN ({quoted})"
+
+    raise ValueError(
+        f"Unsupported VS_ENDPOINT_TYPE: {VS_ENDPOINT_TYPE!r}"
+    )
+
+
+def _empty_result(status, message, **extra):
+    """Consistent output structure for unsuccessful retrieval."""
+    return {
+        "status": status,
+        "message": message,
+        "eligible_document_ids": [],
+        "retrieved_context": [],
+        "llm_context": "",
+        **extra,
+    }
+
+
+# ----------------------------------------------------------
+# 4. IDENTIFY THE DOCUMENT NODES IN CELL 16 SUBGRAPH
+# ----------------------------------------------------------
+
+# Normalize graph node IDs so URIRef/string differences do not
+# cause document nodes to be missed.
+subgraph_nodes = {
+    _clean(node)
+    for node in visited.keys()
+    if _clean(node)
+}
+
+for edge in edges:
+    source_node = _clean(edge.get("source"))
+    target_node = _clean(edge.get("target"))
+
+    if source_node:
+        subgraph_nodes.add(source_node)
+
+    if target_node:
+        subgraph_nodes.add(target_node)
+
+print("=" * 75)
+print("CELL 17: SUBGRAPH-FILTERED HYBRID RETRIEVAL")
+print("=" * 75)
+print("Query:", QUERY)
+print("Subgraph nodes:", len(subgraph_nodes))
+print("Subgraph edges:", len(edges))
+
+if not subgraph_nodes:
+    result = _empty_result(
+        "empty_subgraph",
+        "Cell 16 produced no subgraph nodes."
+    )
+
+else:
+    # ------------------------------------------------------
+    # 5. LOOK UP ONLY DOCUMENT NODES IN THIS SUBGRAPH
+    # ------------------------------------------------------
+
+    # The RDF graph stores each document's reference using
+    # ex:sourceReference. Query only the current subgraph URIs.
+    # This avoids scanning every RDF document on every query.
+
+    safe_uris = sorted(
+        node for node in subgraph_nodes
+        if "<" not in node
+        and ">" not in node
+        and "\n" not in node
+        and "\r" not in node
+    )
+
+    if safe_uris:
+        values_block = " ".join(
+            f"<{uri}>" for uri in safe_uris
+        )
+
+        doc_query = f"""
+        PREFIX ex: <http://knwbt.local/kg/schema/>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+        SELECT DISTINCT ?doc ?ref ?label
+        WHERE {{
+            VALUES ?doc {{ {values_block} }}
+            ?doc a ex:Document ;
+                 ex:sourceReference ?ref .
+            OPTIONAL {{ ?doc rdfs:label ?label }}
+        }}
+        """
+
+        doc_rows = list(g.query(doc_query))
+    else:
+        doc_rows = []
+
+    # URI -> reference and label
+    doc_records = {}
+
+    for row in doc_rows:
+        doc_uri = _clean(row.doc)
+        doc_ref = _clean(row.ref)
+        doc_title = _clean(row.label) or doc_ref
+
+        if doc_uri and doc_ref:
+            doc_records[doc_uri] = {
+                "doc_uri": doc_uri,
+                "doc_reference": doc_ref,
+                "doc_title": doc_title,
+            }
+
+    print("Document nodes in subgraph:", len(doc_records))
+
+    if not doc_records:
+        result = _empty_result(
+            "no_document_nodes",
+            "No document nodes were found in the current subgraph."
+        )
+
+    else:
+        # --------------------------------------------------
+        # 6. MAP DOCUMENT REFERENCES TO INDEX SOURCE VALUES
+        # --------------------------------------------------
+
+        # Collect only references found in the subgraph.
+        # Do NOT collect the entire knowledge_nodes table.
+
+        eligible_refs = sorted({
+            record["doc_reference"]
+            for record in doc_records.values()
+        })
+
+        mapping_rows = (
+            knowledge_nodes
+            .select("node_id", "source")
+            .filter(
+                F.col("node_id").isin(eligible_refs)
+            )
+            .dropna(subset=["node_id", "source"])
+            .distinct()
+            .collect()
+        )
+
+        ref_to_sources = {}
+
+        for row in mapping_rows:
+            ref = _clean(row["node_id"])
+            src = _clean(row["source"])
+
+            if ref and src:
+                ref_to_sources.setdefault(
+                    ref, set()
+                ).add(src)
+
+        # Fail closed on ambiguous references. One graph
+        # reference should map to one index source value.
+        unmapped_refs = []
+        ambiguous_refs = []
+
+        for record in doc_records.values():
+            ref = record["doc_reference"]
+            sources = ref_to_sources.get(ref, set())
+
+            if len(sources) == 0:
+                unmapped_refs.append(ref)
+
+            elif len(sources) > 1:
+                ambiguous_refs.append({
+                    "reference": ref,
+                    "sources": sorted(sources),
+                })
+
+            else:
+                record["doc_source"] = next(iter(sources))
+
+        eligible_records = [
+            record for record in doc_records.values()
+            if "doc_source" in record
+        ]
+
+        eligible_sources = sorted({
+            record["doc_source"]
+            for record in eligible_records
+        })
+
+        print("Mapped document nodes:", len(eligible_records))
+        print("Eligible source values:", len(eligible_sources))
+        print("Unmapped references:", len(unmapped_refs))
+        print("Ambiguous references:", len(ambiguous_refs))
+
+        if unmapped_refs and DEBUG:
+            print("Unmapped:", unmapped_refs[:10])
+
+        if ambiguous_refs and DEBUG:
+            print("Ambiguous:", ambiguous_refs[:10])
+
+        if not eligible_sources:
+            result = _empty_result(
+                "no_eligible_documents",
+                "No subgraph documents mapped unambiguously "
+                "to Vector Search source metadata.",
+                unmapped_refs=unmapped_refs,
+                ambiguous_refs=ambiguous_refs,
+            )
+
+        else:
+            # ----------------------------------------------
+            # 7. FILTERED HYBRID SEARCH + RERANKING
+            # ----------------------------------------------
+
+            try:
+                vsc = VectorSearchClient()
+
+                index = vsc.get_index(
+                    endpoint_name=VS_ENDPOINT_NAME,
+                    index_name=VS_INDEX_NAME,
+                )
+
+                search_results = index.similarity_search(
+                    query_text=QUERY,
+                    columns=[
+                        VS_ID_COLUMN,
+                        VS_TEXT_COLUMN,
+                        VS_DOC_KEY_COLUMN,
+                    ],
+                    filters=_build_filter(eligible_sources),
+                    query_type=QUERY_TYPE,
+                    num_results=TOP_K,
+                    reranker=DatabricksReranker(
+                        columns_to_rerank=[VS_TEXT_COLUMN]
+                    ),
+                )
+
+            except Exception as exc:
+                result = _empty_result(
+                    "search_error",
+                    f"Vector Search failed: {exc}",
+                    eligible_document_ids=eligible_sources,
+                    unmapped_refs=unmapped_refs,
+                    ambiguous_refs=ambiguous_refs,
+                )
+
+            else:
+                # ------------------------------------------
+                # 8. PARSE RESULTS USING RESPONSE MANIFEST
+                # ------------------------------------------
+
+                manifest_columns = [
+                    col.get("name")
+                    for col in (
+                        search_results.get("manifest") or {}
+                    ).get("columns", [])
+                ]
+
+                rows = (
+                    (search_results.get("result") or {})
+                    .get("data_array") or []
+                )
+
+                if manifest_columns:
+                    def column_index(name):
+                        if name not in manifest_columns:
+                            raise RuntimeError(
+                                f"Column {name!r} not found in "
+                                f"response: {manifest_columns}"
+                            )
+                        return manifest_columns.index(name)
+
+                    i_id = column_index(VS_ID_COLUMN)
+                    i_text = column_index(VS_TEXT_COLUMN)
+                    i_source = column_index(VS_DOC_KEY_COLUMN)
+
+                    # Only read a score if it is explicitly present.
+                    score_columns = [
+                        i for i, name in enumerate(manifest_columns)
+                        if "score" in str(name).lower()
+                    ]
+                    i_score = (
+                        score_columns[0]
+                        if score_columns else None
+                    )
+
+                else:
+                    # Fallback to requested output column order.
+                    i_id, i_text, i_source = 0, 1, 2
+                    i_score = None
+
+                # Defensive post-check: the server-side filter
+                # is the primary restriction; reject any mismatch.
+                allowed_sources = set(eligible_sources)
+                candidates = []
+                out_of_scope = 0
+
+                for position, row in enumerate(rows):
+                    if len(row) <= max(i_id, i_text, i_source):
+                        continue
+
+                    source = _clean(row[i_source])
+
+                    if source not in allowed_sources:
+                        out_of_scope += 1
+                        continue
+
+                    score = None
+
+                    if (
+                        i_score is not None
+                        and i_score < len(row)
+                        and row[i_score] is not None
+                    ):
+                        try:
+                            score = float(row[i_score])
+                        except (TypeError, ValueError):
+                            score = None
+
+                    candidates.append({
+                        "rerank_position": position + 1,
+                        "chunk_id": row[i_id],
+                        "content": row[i_text] or "",
+                        "doc_source": source,
+                        "score": score,
+                    })
+
+                if out_of_scope:
+                    print(
+                        "WARNING: rejected out-of-scope results:",
+                        out_of_scope
+                    )
+
+                print("Search results returned:", len(rows))
+                print("Eligible candidates:", len(candidates))
+
+                # ------------------------------------------
+                # 9. SELECT FINAL TOP-K
+                # ------------------------------------------
+
+                selected = candidates[:TOP_K]
+
+                # Map source -> document metadata.
+                # If a source maps to multiple graph documents,
+                # avoid arbitrarily assigning a title or hop.
+                records_by_source = {}
+
+                for record in eligible_records:
+                    records_by_source.setdefault(
+                        record["doc_source"], []
+                    ).append(record)
+
+                retrieved_context = []
+
+                for rank, chunk in enumerate(selected, start=1):
+                    matching_docs = records_by_source.get(
+                        chunk["doc_source"], []
+                    )
+
+                    # A source shared by multiple graph nodes
+                    # cannot uniquely identify which graph node
+                    # the chunk came from.
+                    unique_doc = (
+                        matching_docs[0]
+                        if len(matching_docs) == 1
+                        else None
+                    )
+
+                    retrieved_context.append({
+                        "rank": rank,
+                        "chunk_id": chunk["chunk_id"],
+                        "content": chunk["content"],
+                        "doc_source": chunk["doc_source"],
+                        "doc_reference": (
+                            unique_doc["doc_reference"]
+                            if unique_doc else None
+                        ),
+                        "doc_uri": (
+                            unique_doc["doc_uri"]
+                            if unique_doc else None
+                        ),
+                        "doc_title": (
+                            unique_doc["doc_title"]
+                            if unique_doc else chunk["doc_source"]
+                        ),
+                        "score": chunk["score"],
+                        "rerank_position": chunk["rerank_position"],
+                    })
+
+                # ------------------------------------------
+                # 10. BUILD LLM CONTEXT
+                # ------------------------------------------
+
+                context_blocks = []
+
+                for item in retrieved_context:
+                    context_blocks.append(
+                        f"[Chunk {item['rank']} | "
+                        f"Source: {item['doc_title']} | "
+                        f"Document: {item['doc_source']}]\n"
+                        f"{item['content']}"
+                    )
+
+                llm_context = "\n\n".join(context_blocks)
+
+                result = {
+                    "status": "ok" if selected else "no_matching_chunks",
+                    "message": (
+                        f"Selected {len(selected)} chunks from "
+                        f"{len(eligible_sources)} eligible source values."
+                    ),
+                    "eligible_document_ids": eligible_sources,
+                    "retrieved_context": retrieved_context,
+                    "llm_context": llm_context,
+                    "unmapped_refs": unmapped_refs,
+                    "ambiguous_refs": ambiguous_refs,
+                    "candidate_count": len(candidates),
+                    "out_of_scope_count": out_of_scope,
+                }
+
+
+# ----------------------------------------------------------
+# 11. EXPORT RESULTS TO NOTEBOOK VARIABLES
+# ----------------------------------------------------------
+
+retrieval_status = result["status"]
+eligible_document_ids = result["eligible_document_ids"]
+retrieved_context = result["retrieved_context"]
+llm_context = result["llm_context"]
+
+print()
+print("=" * 75)
+print("RETRIEVAL SUMMARY")
+print("=" * 75)
+print("Status:", retrieval_status)
+print(result["message"])
+print("Eligible sources:", len(eligible_document_ids))
+print("Selected chunks:", len(retrieved_context))
+
+for item in retrieved_context:
+    print(
+        f"\nRank {item['rank']} | "
+        f"Source: {item['doc_source']} | "
+        f"Score: {item['score']}"
+    )
+    print(item["content"][:300])
+
+print("\nLLM context characters:", len(llm_context))
