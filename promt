@@ -1,0 +1,176 @@
+Task: Implement Subgraph-Filtered Hybrid Vector Search with Databricks Reranker
+I have an existing Graph RAG implementation in a Databricks notebook named KG_ontology_graph.ipynb. Cells 1–16 are already implemented. Cell 16 performs query-based entity extraction, entity linking, and graph traversal to generate a query-specific subgraph.
+
+I want to implement the next stage in a new cell immediately after Cell 16.
+
+First, inspect the existing notebook and understand the variables, data structures, RDF namespaces, document identifiers, and helper functions already defined. Reuse the existing implementation wherever possible.
+
+1. Existing setup
+My knowledge graph contains approximately 200 XML articles interconnected through hyperlinks.
+
+Cell 16 already generates a query-specific subgraph.
+
+All chunks from the 200 XML articles have already been created, embedded, and stored in an existing Databricks Vector Search index.
+
+I want to retrieve relevant chunks only from the XML articles identified by the current query's subgraph.
+
+I do not want to recreate chunks, regenerate embeddings, or rebuild the Vector Search index.
+
+Existing Vector Search index:
+
+knwbt_airr_foundry_dev_catalog.secured.200_xml_data
+
+Existing Vector Search endpoint:
+
+knowbot_vector_search
+
+My existing Vector Search code uses VectorSearchClient, index.similarity_search(), query_type="hybrid", and DatabricksReranker.
+
+The index contains metadata fields such as content, id, and source. Inspect the actual schema to determine which fields identify the original XML article and which contain the chunk text.
+
+2. Required workflow
+Step 1: Reuse the existing subgraph
+Reuse the output of Cell 16 for the current query.
+
+Do not repeat entity extraction, entity linking, graph construction, or graph traversal.
+
+Identify the document nodes in the subgraph using the actual variables and structures defined in the notebook.
+
+Step 2: Dynamically identify the eligible XML articles
+Extract the document identifiers corresponding to the actual document nodes in the current subgraph.
+
+Map these identifiers to the corresponding document metadata values stored in the existing Vector Search index.
+
+The number of eligible documents must be determined dynamically from the current query's subgraph.
+
+For example, the subgraph might contain 18 relevant document nodes, but this is only an illustration. The actual number can vary for every query.
+
+Do not hardcode a document count, impose an arbitrary document-count threshold, or assume every node in the subgraph is a document. Distinguish document nodes from entity-only nodes.
+
+Step 3: Apply metadata filtering to the existing Vector Search index
+Connect to the existing 200_xml_data index.
+
+Apply a metadata filter so that only chunks belonging to the eligible XML articles identified by the current subgraph can participate in retrieval.
+
+The filter must be dynamic and must use the actual document identifiers or source metadata values mapped from the subgraph.
+
+Do not:
+
+Search the unrestricted collection of all 200 XML articles and filter the returned results afterward.
+
+Recreate or rechunk the documents.
+
+Regenerate embeddings.
+
+Rebuild the index.
+
+Hardcode an example list of document IDs.
+
+Use the metadata-filter syntax supported by the installed Databricks SDK and the configured index.
+
+Step 4: Perform hybrid retrieval
+Using the current query, perform hybrid retrieval over the filtered chunks.
+
+Combine:
+
+Vector similarity search.
+
+Keyword search.
+
+Retrieve relevant candidate chunks from the eligible documents only.
+
+The number of candidate chunks must be selected as a configurable retrieval parameter based on the requirements of the implementation and the supported API. An example such as 15 candidate chunks is illustrative only; it is not a mandatory threshold or fixed value.
+
+Do not hardcode an example candidate count unless it is deliberately defined as a configurable parameter.
+
+Step 5: Apply Databricks Reranker
+Use the existing DatabricksReranker implementation to rerank the candidate chunks according to their relevance to the current query.
+
+Follow the API supported by the installed Databricks SDK and configured endpoint.
+
+Verify how the reranker returns and orders results. Do not assume it retrieves additional candidates beyond those supplied by hybrid search.
+
+Step 6: Select the final Top-K chunks
+Select the final Top-K chunks from the reranked candidates.
+
+Make TOP_K configurable. Choose its initial value based on the existing notebook's evaluation requirements or clearly identify it as a configuration choice.
+
+Do not confuse:
+
+The number of document nodes in the subgraph.
+
+The number of chunks returned by hybrid retrieval.
+
+The number of final chunks selected for the LLM context.
+
+These are three separate quantities, and none should be inferred from the illustrative examples.
+
+If fewer than the requested number of chunks are available, return the available relevant chunks without fabricating results.
+
+Step 7: Prepare the LLM context
+Create a structured variable containing the selected chunks and their available metadata, including:
+
+Chunk content.
+
+Document identifier.
+
+Source XML article.
+
+Retrieval or reranking scores, if available.
+
+Combine the final selected chunks into an llm_context string, retaining source information where appropriate.
+
+Do not call the LLM or generate an answer in this cell. Only prepare the context for the subsequent LLM-generation stage.
+
+3. Expected pipeline
+The implementation must follow this sequence:
+
+Current query → Existing Cell 16 subgraph → Dynamic document identification → Document-ID mapping → Metadata-filtered Vector Search → Hybrid retrieval → Databricks Reranker → Configurable Top-K selection → LLM context.
+
+The core requirement is that only chunks belonging to the current query's eligible subgraph documents are allowed into the candidate retrieval and reranking stages.
+
+4. Implementation requirements
+Inspect the actual notebook and reuse existing variables, helper functions, graph namespaces, and document structures.
+
+Provide a complete code cell that can be inserted immediately after Cell 16.
+
+Explain the code statement by statement.
+
+Reuse the existing Vector Search index and its stored embeddings.
+
+Verify the correct metadata-filter syntax and reranker behavior for the installed Databricks SDK.
+
+Determine document eligibility dynamically from the current subgraph.
+
+Do not treat example document counts or candidate counts as thresholds, fixed limits, or mandatory configuration values.
+
+Make retrieval parameters and final Top-K selection configurable.
+
+Ensure that chunks from documents outside the subgraph cannot enter the candidate set.
+
+Handle empty subgraphs, missing document mappings, empty retrieval results, and API errors.
+
+Preserve the association between each chunk and its original document.
+
+Do not invent missing variable names, metadata fields, schemas, or API parameters. If a required detail cannot be determined from the notebook, explain exactly what must be checked.
+
+If the index does not support the required metadata filter directly, explain the limitation and propose a technically valid alternative that preserves the restriction to subgraph documents.
+
+Do not modify existing Cells 1–16 unless a necessary dependency is missing. Explain any required changes separately.
+
+5. Expected output
+The new cell should produce:
+
+The dynamically identified eligible document IDs.
+
+The number of eligible documents for the current query.
+
+The candidate chunks returned by filtered hybrid retrieval.
+
+The final Top-K reranked chunks.
+
+A structured retrieved_context variable.
+
+An llm_context string ready for the next LLM-generation cell.
+
+Implement the solution based on the actual notebook, preserving the existing architecture and ensuring that all counts and selection behavior are driven by the current query and explicit configuration rather than illustrative examples.
